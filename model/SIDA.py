@@ -77,7 +77,7 @@ class SidaMetaModel:
             self.vision_pretrained = kwargs.get("vision_pretrained", None)
         else:
             self.vision_pretrained = kwargs.get("vision_pretrained", None)
-            self.initialize_sida_modules(self.config)
+            self.initialize_sida_modules(self.config) 
 
     def initialize_sida_modules(self, config):
         # SAM
@@ -90,6 +90,7 @@ class SidaMetaModel:
                 param.requires_grad = True
 
         # Projection layer
+        # config.hidden_size 4096
         in_dim = config.hidden_size
         out_dim = config.out_dim
         text_fc = [
@@ -163,8 +164,10 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
         super().__init__(config)
         self.model = SidaModel(config, **kwargs)
         self.model.initialize_sida_modules(config)
+        # config.hidden_size 4096; config.vocab_size 32004
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+        
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
         with torch.no_grad():
             image_embeddings_list = []
@@ -201,30 +204,42 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
     ):
         if images.size(0) != images_clip.size(0):
             raise ValueError(f"Batch size mismatch: images {images.size(0)} != images_clip {images_clip.size(0)}")
+        # print("images: ", images.size())
         image_embeddings = self.get_visual_embs(images)
+        # print("images: ", image_embeddings.shape)
         B, C, H, W = image_embeddings.shape
+        # raise ValueError
         
         assert B == len(offset) - 1
+        # cls_token_mask [N, L - 1]
+        # 每个位置True表示“这个位置的token是[CLS]"
         cls_token_mask = (input_ids[:,1:] == self.cls_token_idx)
+        # cls_token_mask [N, L] 让 mask 的长度和原始 input_ids 对齐
         cls_token_mask = torch.cat([
             cls_token_mask,
             torch.zeros((cls_token_mask.shape[0], 1)).bool().cuda()
             ], 
             dim=1)
+        # 把 mask 对齐到 “LLaVA 实际进入 LLaMA 的 token 序列”
+        # “前 255 个位置是图像 token，不可能是 [CLS]，所以全 False”
         cls_token_mask =  torch.cat(
             [
             torch.zeros((cls_token_mask.shape[0], 255)).bool().cuda(),  # Padding with 255 zeros at the beginning
             cls_token_mask,
             ],
                 dim=1,
-            )
+            ) 
+        # 这里生成 [SEG] token 的位置 mask：shape [N, L-1], True 表示该 token 是 [SEG]
         seg_token_mask = (input_ids[:, 1:] == self.seg_token_idx)
 
+        # 给 seg_mask 前补 255、后补 1
         seg_token_mask = torch.cat([
             torch.zeros((seg_token_mask.shape[0], 255), dtype=torch.bool, device=input_ids.device),
             seg_token_mask,
             torch.zeros((seg_token_mask.shape[0], 1),   dtype=torch.bool, device=input_ids.device)], dim=1)
-
+        # cls_token_mask [N, 255 + L]
+        # seg_token_mask [N, 255 + L]
+        
         if inference:
             n_batch = 1
             length = input_ids.shape[0]
@@ -267,14 +282,31 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             )
             output_hidden_states = output.hidden_states
             # Geting cls information
+        # print("++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        # print("output_hidden_states[-1]: ", output_hidden_states[-1].shape)
+        # print("++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        # raise ValueError
+        # output_hidden_states[-1]:  torch.Size([2, 339, 4096])
         assert len(self.model.cls_head) == 1
         last_hidden_state_cls = self.model.cls_head[0](output_hidden_states[-1]) 
-
+        # print("++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        # print("output_hidden_states[-1]: ", last_hidden_state_cls.shape)
+        
         cls_result = last_hidden_state_cls[cls_token_mask]
-
+        # cls_result[-1]:  torch.Size([2, 3])
+        # print("cls_result: ", cls_result.shape)
+        # print("++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        
+        
+    
         logits = cls_result
         loss_fct = nn.CrossEntropyLoss()
         cls_loss = loss_fct(logits, cls_labels)
+        # print("cls_loss: ", cls_loss)
+        # print("cls_labels: ", cls_labels)
+        # print("cls_labels.shape: ", cls_labels.shape)
+        # print("++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        # raise ValueError
 
         #Geting segmentation
         mask_bce_loss = mask_dice_loss = mask_loss = torch.tensor(0.0, device=cls_loss.device)
@@ -283,7 +315,11 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             hidden_states = []
             hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            # print("last_hidden_state: ", last_hidden_state.shape)
             pred_embeddings = last_hidden_state[seg_token_mask]
+            # print("pred_embeddings: ", pred_embeddings.shape)
+            # pred_embeddings:  torch.Size([2, 256])
+            # raise ValueError
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
             seg_token_offset = seg_token_counts.cumsum(-1)
             seg_token_offset = torch.cat(
@@ -298,8 +334,14 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
                 start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
                 pred_embeddings_.append(pred_embeddings[start_i:end_i])
             pred_embeddings = pred_embeddings_
-            #Attention
+            # print("pred_embeddings: ", len(pred_embeddings))
+            # print("pred_embeddings[0]: ", pred_embeddings[0].shape)
+            # raise ValueError
+
+            # Attention
             cls_projected = self.model.sida_fc1(cls_result)
+            # cls_projected [B, 256]
+
             enhanced_pred_embeddings = []
             for i in range(len(pred_embeddings)):
                 seg_embeddings = pred_embeddings[i]
@@ -315,10 +357,10 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
                 enhanced_pred_embeddings.append(enhanced_embeddings)
             multimask_output = False
 
+
             pred_masks = []
             for i in range(len(enhanced_pred_embeddings)):
                 (
-                    
                     sparse_embeddings,
                     dense_embeddings,
                 ) = self.model.visual_model.prompt_encoder(
@@ -328,7 +370,6 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
                     text_embeds=enhanced_pred_embeddings[i].unsqueeze(1),
                 )
 
-
                 sparse_embeddings = sparse_embeddings.to(enhanced_pred_embeddings[i].dtype)
                 low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
@@ -337,7 +378,6 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
                     dense_prompt_embeddings=dense_embeddings,
                     multimask_output=multimask_output,
                 )
-
 
                 pred_mask = self.model.visual_model.postprocess_masks(
                     low_res_masks,

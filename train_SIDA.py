@@ -31,6 +31,8 @@ def parse_args(args):
     parser.add_argument(
         "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
     )
+    # pre-train weight
+
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",
@@ -53,10 +55,12 @@ def parse_args(args):
     parser.add_argument("--log_base_dir", default="./runs", type=str)
     parser.add_argument("--exp_name", default="sida", type=str)
     parser.add_argument("--epochs", default=10, type=int)
-    parser.add_argument("--steps_per_epoch", default=500, type=int)
+    # 一个 epoch 包含 500 次参数更新
+    parser.add_argument("--steps_per_epoch", default=100, type=int)
     parser.add_argument(
         "--batch_size", default=2, type=int, help="batch size per device per step"
     )
+    # 用 10 个 micro-batch 的梯度相加，等效于更大的 batch 再更新一次参数。
     parser.add_argument(
         "--grad_accumulation_steps",
         default=10,
@@ -103,11 +107,13 @@ def parse_args(args):
     )
 
     return parser.parse_args(args)
+
 def main(args):
     args = parse_args(args)
     # Move the check here, after parsing
     deepspeed.init_distributed()
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
+    
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
@@ -136,22 +142,24 @@ def main(args):
     model_args = {
         "train_mask_decoder": args.train_mask_decoder,
         "out_dim": args.out_dim,
-        "cls_loss_weight": args.cls_loss_weight,
-        "mask_loss_weight": args.mask_loss_weight,
-        "ce_loss_weight": args.ce_loss_weight,
-        "dice_loss_weight": args.dice_loss_weight,
-        "bce_loss_weight": args.bce_loss_weight,
+        "cls_loss_weight": args.cls_loss_weight, # 分类损失
+        "mask_loss_weight": args.mask_loss_weight, # mask损失 分割损失
+        "ce_loss_weight": args.ce_loss_weight, # 文本损失
+        "dice_loss_weight": args.dice_loss_weight, # mask损失1
+        "bce_loss_weight": args.bce_loss_weight, # mask损失2
         "cls_token_idx": args.cls_token_idx,
         "seg_token_idx": args.seg_token_idx,
         "vision_pretrained": args.vision_pretrained,
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
     }
+
     torch_dtype = torch.float32
     if args.precision == "bf16":
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
+
     model = SIDAForCausalLM.from_pretrained(
         args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
     )
@@ -159,6 +167,7 @@ def main(args):
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
+
     print("\nChecking specific components:")
     for component in [ "cls_head", "sida_fc1", "attention_layer", "text_hidden_fcs"]:
         matching_params = [n for n, _ in model.named_parameters() if component in n]
@@ -166,17 +175,28 @@ def main(args):
             print(f"Found {component} in parameters: {matching_params}")
         else:
             print(f"Component not found: {component}")
+
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
+    # 这个看看
     model.get_model().initialize_vision_modules(model.get_model().config)
+
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype, device=args.local_rank)
+
+    # 只有在训练（不是纯评估）时，才把 SIDA 自己新增的模块真正初始化/挂载到 backbone 上。
     if not args.eval_only:
         model.get_model().initialize_sida_modules(model.get_model().config)
 
+    # 训练时不更新 CLIP ViT 的参数
+    # CLIP ViT 只作为一个固定特征提取器（feature extractor）
     for p in vision_tower.parameters():
         p.requires_grad = False
 
+    # mm_projector 是 LLaVA 的关键部件：把 CLIP 输出投影到 LLaMA hidden size，让视觉 token 能“插进”语言模型。
+    # 冻结它意味着：
+    # 视觉→语言的对齐映射固定不动
+    # 训练只在语言侧和 SIDA 新增模块上完成
     for p in model.get_model().mm_projector.parameters():
         p.requires_grad = False
 
@@ -185,6 +205,7 @@ def main(args):
         args.conv_type
     ]
 
+    # 这里进行了lora，只训练llava中的q_proj,v_proj
     lora_r = args.lora_r
     if lora_r > 0:
         def find_linear_layers(model, lora_target_modules):
@@ -226,12 +247,15 @@ def main(args):
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
+
     model.resize_token_embeddings(len(tokenizer))
 
+    # 冻结语言模型的输出词表分类层（lm_head）
     for n, p in model.named_parameters():
         if "lm_head" in n:
             p.requires_grad = False
 
+    # 显式指定“哪些模块要训练”
     for n, p in model.named_parameters():
         if any(
             [
@@ -241,6 +265,7 @@ def main(args):
         ):
             p.requires_grad = True
 
+    # 计算训练参数
     print("Checking trainable parameters:")
     total_params = 0
     for n, p in model.named_parameters():
@@ -249,8 +274,10 @@ def main(args):
             total_params += p.numel()
     print(f"Total trainable parameters: {total_params}")
 
+    # 当前GPU可见数量
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
+    # 加载数据集
     train_dataset = CustomDataset(
         base_image_dir=args.dataset_dir,  # Root directory containing image data
         tokenizer=tokenizer,
@@ -264,6 +291,7 @@ def main(args):
     print(f"Training split size: {len(train_dataset)}")
 
     if args.no_eval == False:
+        # 验证集
         val_dataset = CustomDataset(
             base_image_dir=args.dataset_dir,  # Root directory containing image data
             tokenizer=tokenizer,
@@ -278,8 +306,9 @@ def main(args):
     else:
         val_dataset = None
         print(f"Training with {len(train_dataset)} examples.")
+
     ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
+        "train_micro_batch_size_per_gpu": args.batch_size, # 每个GPU上的batchsize
         "gradient_accumulation_steps": args.grad_accumulation_steps,
         "optimizer": {
             "type": "AdamW",
@@ -321,6 +350,8 @@ def main(args):
             "allgather_bucket_size": 5e8,
         },
     }
+
+    # 这段是在为分布式训练构建一个“自定义批采样器”：它决定每张 GPU（每个 rank）在每一步拿哪些样本 index 组成一个 batch，并且保证多卡之间不重复/不冲突。
     batch_sampler = BatchSampler(
         dataset=train_dataset,
         batch_size=ds_config["train_micro_batch_size_per_gpu"],
@@ -403,8 +434,10 @@ def main(args):
         print(f"\nTraining Configuration:")
         print(f"Total epochs: {args.epochs}")
         print(f"Validation will be performed after epochs: {validation_epochs}")
+
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
+        # 下一次再训练（下一个 epoch），继续沿用上一次训练结束时的 iterator 位置。
         train_iter = train(
             train_loader,
             model_engine,
@@ -429,8 +462,11 @@ def main(args):
                 is_best = is_best_iou or is_best_acc
 
             if args.local_rank == 0:
+                # 分类质量
                 print(f"Current accuracy: {acc:.2f}%, Best accuracy: {best_acc:.2f}%")
+                # 分割质量
                 print(f"Current iou: {cur_ciou:.2f}%, Best score: {best_score:.2f}%")
+
             # Save checkpoints for best performance
             if args.no_eval or is_best:
                 save_dir = os.path.join(args.log_dir, "ckpt_model")
@@ -463,7 +499,7 @@ def main(args):
 
 def train(
     train_loader,
-    model,
+    model, # DeepSpeed 包装后的 model_engine
     epoch,
     scheduler,
     writer,
@@ -496,6 +532,7 @@ def train(
 
             data_time.update(time.time() - end)
             input_dict = dict_to_cuda(input_dict)
+
             if args.precision == "fp16":
                 input_dict["images"] = input_dict["images"].half()
                 input_dict["images_clip"] = input_dict["images_clip"].half()
@@ -505,14 +542,19 @@ def train(
             else:
                 input_dict["images"] = input_dict["images"].float()
                 input_dict["images_clip"] = input_dict["images_clip"].float()
+
             output_dict = model(**input_dict)
+
             loss = output_dict["loss"]
             cls_loss = output_dict["cls_loss"]
             mask_bce_loss = output_dict["mask_bce_loss"]
             mask_dice_loss = output_dict["mask_dice_loss"]
             mask_loss = output_dict["mask_loss"]
+
             losses.update(loss.item(), input_dict["images"].size(0))
+
             cls_losses.update(cls_loss.item(), input_dict["images"].size(0))
+
             if input_dict['cls_labels'][0] == 2:
                 mask_bce_losses.update(mask_bce_loss.item(), input_dict["images"].size(0))
                 mask_dice_losses.update(mask_dice_loss.item(), input_dict["images"].size(0))
@@ -542,6 +584,7 @@ def train(
                 writer.add_scalar("train/mask_loss", mask_losses.avg, global_step)
                 writer.add_scalar("metrics/total_secs_per_batch", batch_time.avg, global_step)
                 writer.add_scalar("metrics/data_secs_per_batch", data_time.avg, global_step)
+
             batch_time.reset()
             data_time.reset()
             losses.reset()
@@ -556,6 +599,7 @@ def train(
                 writer.add_scalar("train/lr", curr_lr[0], global_step)
 
     return train_iter
+
 import random
 
 def validate(val_loader, model_engine, epoch, writer, args, sample_ratio=None):
@@ -567,11 +611,16 @@ def validate(val_loader, model_engine, epoch, writer, args, sample_ratio=None):
     model_engine.eval()
     correct = 0
     total = 0
-    num_classes = 3
+    num_classes = args.num_classes
     confusion_matrix = torch.zeros(num_classes, num_classes, device='cuda')
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
+
+    # intersection_meter：像素交集总和
+    # union_meter：像素并集总和
+    # acc_iou_meter：逐 mask IoU 的累积（后面算 gIoU）
+    # Summary.SUM 表示跨 batch 做求和（不是平均）
 
     # Calculate total number of batches and samples to use
     total_batches = len(val_loader)
@@ -695,7 +744,7 @@ def validate(val_loader, model_engine, epoch, writer, args, sample_ratio=None):
     avg_precision = np.mean([metrics['precision'] for metrics in per_class_metrics.values()])
     avg_recall = np.mean([metrics['recall'] for metrics in per_class_metrics.values()])
 
- # Approximate AUC as the area under the average precision-recall curve
+    # Approximate AUC as the area under the average precision-recall curve
     auc_approx = avg_precision * avg_recall
 
     # Log metrics

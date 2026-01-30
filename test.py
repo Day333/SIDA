@@ -251,7 +251,7 @@ def main(args):
         base_image_dir=args.dataset_dir,  
         tokenizer=tokenizer,
         vision_tower=args.vision_tower,  
-        split="train", 
+        split="test", 
         precision=args.precision,  
         image_size=args.image_size, 
 
@@ -560,6 +560,12 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
 
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    all_pixel_probs = []
+    all_pixel_labels = []
+
+
     # Calculate total number of batches and samples to use
     total_batches = len(test_loader)
     if sample_ratio is not None:
@@ -614,6 +620,15 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
         if cls_labels[0] == 2:
             pred_masks = output_dict["pred_masks"]
             masks_list = output_dict["gt_masks"][0].int()
+
+            # add
+            prob_map = torch.sigmoid(pred_masks[0])   # [N, H, W]
+            gt_map   = masks_list                     # [N, H, W]
+
+            all_pixel_probs.append(prob_map.flatten().detach().cpu())
+            all_pixel_labels.append(gt_map.flatten().detach().cpu())
+            # add
+
             output_list = (pred_masks[0] > 0).int()
             assert len(pred_masks) == 1
 
@@ -677,6 +692,17 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
 
     auc_approx = avg_precision * avg_recall
 
+    if len(all_pixel_probs) > 0:
+        pixel_probs  = torch.cat(all_pixel_probs).numpy()
+        pixel_labels = torch.cat(all_pixel_labels).numpy()
+
+        loc_pr_auc  = average_precision_score(pixel_labels, pixel_probs)
+        loc_roc_auc = roc_auc_score(pixel_labels, pixel_probs)
+    else:
+        loc_pr_auc  = 0.0
+        loc_roc_auc = 0.0
+
+
     if args.local_rank == 0:
         writer.add_scalar("test/accuracy", accuracy, epoch)
         writer.add_scalar("test/giou", giou, epoch)
@@ -685,41 +711,109 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
         writer.add_scalar("test/iou", iou, epoch)
         writer.add_scalar("test/f1_score", f1_score, epoch)
         writer.add_scalar("test/auc_approx", auc_approx, epoch)
+        writer.add_scalar("test/localization_pr_auc", loc_pr_auc, epoch)
+        writer.add_scalar("test/localization_roc_auc", loc_roc_auc, epoch)
+
         for class_name, metrics in per_class_metrics.items():
          for metric_name, value in metrics.items():
              writer.add_scalar(f"test/{class_name.lower().replace('/', '_')}_{metric_name}", value, epoch)
 
-        test_type = "Full" if sample_ratio is None else f"Sampled ({sample_ratio*100}%)"
-        print(f"\n{test_type} test Results:")
-        print(f"giou: {giou:.4f}, ciou: {ciou:.4f}")
-        print(f"Classification Accuracy: {accuracy:.4f}%")
-        print(f"Pixel Accuracy: {pixel_accuracy:.4f}%")
-        print(f"IoU: {iou:.4f}")
-        print(f"F1 Score: {f1_score:.4f}")
-        print(f"Approximate AUC: {auc_approx:.4f}")
-        print(f"Total correct classifications: {correct}")
-        print(f"Total classification samples: {total}")
-        print("\nPer-Class Metrics:")
-        for class_name, metrics in per_class_metrics.items():
-            print(f"\n{class_name}:")
-            print(f"  Accuracy:  {metrics['accuracy']:.4f}")
-            print(f"  Precision: {metrics['precision']:.4f}")
-            print(f"  Recall:    {metrics['recall']:.4f}")
-            print(f"  F1 Score:  {metrics['f1']:.4f}")
+        # test_type = "Full" if sample_ratio is None else f"Sampled ({sample_ratio*100}%)"
+        # print(f"\n{test_type} test Results:")
+        # print(f"giou: {giou:.4f}, ciou: {ciou:.4f}")
+        # print(f"Classification Accuracy: {accuracy:.4f}%")
+        # print(f"Pixel Accuracy: {pixel_accuracy:.4f}%")
+        # print(f"IoU: {iou:.4f}")
+        # print(f"F1 Score: {f1_score:.4f}")
+        # print(f"Approximate AUC: {auc_approx:.4f}")
+        # print(f"Total correct classifications: {correct}")
+        # print(f"Total classification samples: {total}")
+        # print(f"Localization PR-AUC: {loc_pr_auc:.4f}")
+        # print(f"Localization ROC-AUC: {loc_roc_auc:.4f}")
 
-        print("\nConfusion Matrix:")
-        print("Predicted ")
-        print("Actual ")
-        print(f"{'':20}", end="")  
+        # print("\nPer-Class Metrics:")
+        # for class_name, metrics in per_class_metrics.items():
+        #     print(f"\n{class_name}:")
+        #     print(f"  Accuracy:  {metrics['accuracy']:.4f}")
+        #     print(f"  Precision: {metrics['precision']:.4f}")
+        #     print(f"  Recall:    {metrics['recall']:.4f}")
+        #     print(f"  F1 Score:  {metrics['f1']:.4f}")
+
+        # print("\nConfusion Matrix:")
+        # print("Predicted ")
+        # print("Actual ")
+        # print(f"{'':20}", end="")  
+        # for name in class_names:
+        #     print(f"{name:>12}", end="") 
+        # print()  
+
+        # for i, class_name in enumerate(class_names):
+        #     print(f"{class_name:20}", end="") 
+        #     for j in range(num_classes):
+        #         print(f"{confusion_matrix[i, j]:12.0f}", end="")
+        #     print()  
+        
+        test_type = "Full" if sample_ratio is None else f"Sampled ({sample_ratio*100}%)"
+
+        print("\n" + "=" * 80)
+        print(f"{test_type} TEST RESULTS".center(80))
+        print("=" * 80)
+
+        # =========================
+        # Detection / Classification
+        # =========================
+        print("\n[Detection / Classification Metrics]")
+        print("-" * 80)
+        print(f"Classification Accuracy : {accuracy:.4f}%")
+        print(f"Approximate AUC         : {auc_approx:.4f}")
+        print(f"F1 Score (Det + Loc)    : {f1_score:.4f}")
+        print(f"Total correct           : {correct}")
+        print(f"Total samples           : {total}")
+
+        # =========================
+        # Localization / Segmentation
+        # =========================
+        print("\n[Localization / Segmentation Metrics]")
+        print("-" * 80)
+        print(f"Pixel Accuracy          : {pixel_accuracy:.4f}%")
+        print(f"Class IoU (cIoU)        : {ciou:.4f}")
+        print(f"Global IoU (gIoU)       : {giou:.4f}")
+        print(f"IoU (reported)          : {iou:.4f}")
+        print(f"Localization PR-AUC     : {loc_pr_auc:.4f}")
+        print(f"Localization ROC-AUC    : {loc_roc_auc:.4f}")
+
+        # =========================
+        # Per-Class Classification Metrics
+        # =========================
+        print("\n[Per-Class Classification Metrics]")
+        print("-" * 80)
+        for class_name, metrics in per_class_metrics.items():
+            print(f"{class_name}:")
+            print(f"  Accuracy  : {metrics['accuracy']:.4f}")
+            print(f"  Precision : {metrics['precision']:.4f}")
+            print(f"  Recall    : {metrics['recall']:.4f}")
+            print(f"  F1 Score  : {metrics['f1']:.4f}")
+
+        # =========================
+        # Confusion Matrix
+        # =========================
+        print("\n[Confusion Matrix]")
+        print("-" * 80)
+        print("Predicted →")
+        print("Actual ↓")
+        print(f"{'':20}", end="")
         for name in class_names:
-            print(f"{name:>12}", end="") 
-        print()  
+            print(f"{name:>14}", end="")
+        print()
 
         for i, class_name in enumerate(class_names):
-            print(f"{class_name:20}", end="") 
+            print(f"{class_name:20}", end="")
             for j in range(num_classes):
-                print(f"{confusion_matrix[i, j]:12.0f}", end="")
-            print()  
+                print(f"{confusion_matrix[i, j]:14.0f}", end="")
+            print()
+
+        print("=" * 80)
+
 
     return accuracy, giou, ciou, per_class_metrics
 

@@ -193,6 +193,10 @@ class CustomDataset(torch.utils.data.Dataset):
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
         # Set up paths
         split_dir = os.path.join(base_image_dir, split)
+        # print("+++++++++++++++++++++")
+        # print(split_dir)
+        # print("+++++++++++++++++++++")
+        # raise ValueError("0000")
         required_dirs = ["real", "full_synthetic", "tampered"]
         for dir_name in required_dirs:
             dir_path = os.path.join(split_dir, dir_name)
@@ -237,12 +241,16 @@ class CustomDataset(torch.utils.data.Dataset):
         print(f"\nDataset Statistics for {split} split:")
         print(f"Real images: {len(real_images)}")
         print(f"Full synthetic images: {len(full_syn_images)}")
-        print(f"Tampered images: {len(valid_tampered_images)} (Valid) / {len(tampered_images)} (Total)")
+        print(f"Tampered images: {len(valid_tampered_images)} (Valid Mask) / {len(tampered_images)} (Total)")
         if self.invalid_samples:
             print(f"Warning: Found {len(self.invalid_samples)} invalid samples")
+        
+        # print("++++++++++++")
+        # raise ValueError("000")
 
     def __len__(self):
         return len(self.images)
+    
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
         x = (x - self.pixel_mean) / self.pixel_std
@@ -294,15 +302,20 @@ class CustomDataset(torch.utils.data.Dataset):
 
         # Generate conversation
         conv = conversation_lib.default_conversation.copy()
+        # print("conv.roles[0]: ", conv.roles[0])
+        # print("conv.roles[1]: ", conv.roles[1])
+        
         conv.append_message(conv.roles[0], 
             f"{DEFAULT_IMAGE_TOKEN}\nCan you identify if this image is real, full synthetic, or tampered image? Please mask the tampered regions if it is tampered.")
         
         response = self._generate_response(cls_labels, image_name)
         conv.append_message(conv.roles[1], response)
         conversation = conv.get_prompt()
+        # print("conversation: ", conversation)
         has_text = None
         labels = torch.ones(mask.shape[1], mask.shape[2]) * self.ignore_label
-        
+        # print("labels: ", labels.shape)
+        # raise ValueError
         return image_path, image, image_clip, [conversation], mask, labels, cls_labels, resize, None, None, False, has_text
 
     def __len__(self):
